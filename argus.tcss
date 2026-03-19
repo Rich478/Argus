@@ -1,0 +1,81 @@
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   ARGUS — The All-Seeing Eye
+   Textual CSS Stylesheet
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+Screen {
+    background: $surface;
+}
+
+#main {
+    height: 1fr;
+}
+
+#tree-panel {
+    width: 1fr;
+    min-width: 24;
+    border: round $primary;
+    border-title-color: $primary-lighten-2;
+    border-title-style: bold;
+    padding: 0 1;
+}
+
+#tree-panel:focus-within {
+    border: round $primary-lighten-1;
+}
+
+#right-panel {
+    width: 3fr;
+    min-width: 40;
+}
+
+#stats-bar {
+    height: auto;
+    max-height: 3;
+    border: round $secondary;
+    border-title-color: $secondary-lighten-2;
+    border-title-style: bold;
+    padding: 0 1;
+}
+
+#legend {
+    height: auto;
+    max-height: 5;
+    padding: 0 1;
+    margin-bottom: 1;
+}
+
+#file-preview {
+    height: 1fr;
+    border: round $accent;
+    border-title-color: $accent-lighten-1;
+    border-title-style: bold;
+    padding: 0 1;
+    margin-bottom: 1;
+}
+
+#activity-feed {
+    height: 1fr;
+    border: round $warning;
+    border-title-color: $warning-lighten-1;
+    border-title-style: bold;
+    padding: 0 1;
+}
+
+Header {
+    background: $primary-darken-3;
+    color: $text;
+}
+
+Footer {
+    background: $primary-darken-3;
+}
+
+Tree {
+    padding: 1 0;
+    scrollbar-size: 1 1;
+}
+
+RichLog {
+    scrollbar-size: 1 1;
+}

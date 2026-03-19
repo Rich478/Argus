@@ -474,6 +474,10 @@ class FilePreview(RichLog):
             self.write(Text("  File no longer exists", style="dim italic"))
             return
 
+        if path.is_symlink():
+            self.write(Text("  Symlink — skipped for security", style="dim italic"))
+            return
+
         if path.suffix.lower() in BINARY_EXTENSIONS:
             try:
                 size = path.stat().st_size
@@ -575,6 +579,8 @@ class ProjectTree(Tree[dict]):
             return
 
         for entry in entries:
+            if entry.is_symlink():
+                continue
             if self._should_ignore(entry):
                 continue
             try:
@@ -903,13 +909,21 @@ class ArgusApp(App):
             actions = self._tailer.poll()
             if actions:
                 for tool_name, file_path in actions:
-                    tree.claude_active[file_path] = now
-                    tree.claude_tools[file_path] = tool_name
-                    tree.auto_expand_to(file_path)
+                    # Validate path resolves within watched directory
                     try:
-                        rel = str(Path(file_path).relative_to(self.watch_path))
-                    except ValueError:
-                        rel = file_path
+                        resolved = Path(file_path).resolve()
+                        if not resolved.is_relative_to(self.watch_path):
+                            # Outside watch tree — log but don't expand/track
+                            feed.log_claude_action(tool_name, resolved.name)
+                            continue
+                        rel = str(resolved.relative_to(self.watch_path))
+                    except (ValueError, OSError):
+                        feed.log_claude_action(tool_name, Path(file_path).name)
+                        continue
+                    file_path_str = str(resolved)
+                    tree.claude_active[file_path_str] = now
+                    tree.claude_tools[file_path_str] = tool_name
+                    tree.auto_expand_to(file_path_str)
                     feed.log_claude_action(tool_name, rel)
                 needs_refresh = True
 

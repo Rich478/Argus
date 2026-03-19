@@ -19,6 +19,7 @@ import json
 import time
 import queue
 import subprocess
+import concurrent.futures
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
@@ -98,7 +99,7 @@ LEXER_MAP = {
     ".md": "markdown", ".rst": "rst",
     ".sh": "bash", ".bash": "bash", ".zsh": "bash",
     ".css": "css", ".scss": "scss", ".less": "css",
-    ".html": "html", ".htm": "html", ".xml": "xml",
+    ".html": "html", ".htm": "html", ".xml": "xml", ".svg": "xml",
     ".sql": "sql",
     ".go": "go", ".rs": "rust", ".rb": "ruby",
     ".java": "java", ".c": "c", ".cpp": "cpp",
@@ -109,7 +110,7 @@ LEXER_MAP = {
 }
 
 BINARY_EXTENSIONS = {
-    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".svg",
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico",
     ".mp3", ".mp4", ".avi", ".mov", ".wav", ".flac", ".ogg",
     ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
     ".zip", ".tar", ".gz", ".bz2", ".7z", ".rar", ".xz",
@@ -137,6 +138,8 @@ MAINTENANCE_INTERVAL = 5.0
 ACTIVITY_MAX_LINES = 500
 PREVIEW_MAX_BYTES = 1_000_000   # skip files larger than 1MB
 PREVIEW_CHUNK_LINES = 50        # write syntax in chunks for smooth scrolling
+SEEN_TOOL_IDS_MAX = 5000        # evict oldest tool IDs to prevent unbounded growth
+SESSION_RECHECK_INTERVAL = 30   # seconds between session directory re-checks
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -152,7 +155,7 @@ def _is_temp_file(name: str) -> bool:
     if name == "4913":  # vim existence check
         return True
     # Claude Code atomic writes: file.py.tmp.28752.1773786165833
-    if ".tmp." in name:
+    if re.search(r'\.tmp\.\d+\.\d+$', name):
         return True
     for prefix in TEMP_PREFIXES:
         if name.startswith(prefix):
@@ -209,11 +212,12 @@ class TranscriptTailer:
     def __init__(self, session_dir: Path):
         self.session_dir = session_dir
         self._offsets: dict[str, int] = {}
-        self._seen_tool_ids: set[str] = set()  # dedup across progress/final entries
+        self._seen_tool_ids: list[str] = []  # dedup across progress/final entries
+        self._seen_tool_set: set[str] = set()
         # Start from current end of all active files (skip history)
-        self._discover_files()
+        self._discover_files(initial=True)
 
-    def _discover_files(self):
+    def _discover_files(self, initial: bool = False):
         """Find transcript .jsonl files and initialise read offsets."""
         cutoff = time.time() - 300  # only files active in last 5 min
         for jsonl in self.session_dir.rglob("*.jsonl"):
@@ -222,7 +226,9 @@ class TranscriptTailer:
                 continue
             try:
                 st = jsonl.stat()
-                if st.st_mtime > cutoff:
+                # On initial load, pick up all recent files regardless of age
+                # On subsequent discovery, only pick up new files
+                if initial or st.st_mtime > cutoff:
                     self._offsets[path_str] = st.st_size
             except OSError:
                 pass
@@ -276,10 +282,16 @@ class TranscriptTailer:
 
             # Deduplicate: progress entries replay the same tool_use block
             tool_id = block.get("id", "")
-            if tool_id and tool_id in self._seen_tool_ids:
+            if tool_id and tool_id in self._seen_tool_set:
                 continue
             if tool_id:
-                self._seen_tool_ids.add(tool_id)
+                self._seen_tool_ids.append(tool_id)
+                self._seen_tool_set.add(tool_id)
+                # Evict oldest entries to prevent unbounded growth
+                if len(self._seen_tool_ids) > SEEN_TOOL_IDS_MAX:
+                    evict = self._seen_tool_ids[:1000]
+                    self._seen_tool_ids = self._seen_tool_ids[1000:]
+                    self._seen_tool_set -= set(evict)
 
             tool_name = block.get("name", "")
             tool_input = block.get("input", {})
@@ -565,18 +577,22 @@ class ProjectTree(Tree[dict]):
         for entry in entries:
             if self._should_ignore(entry):
                 continue
+            try:
+                rel = str(entry.relative_to(self.watch_path))
+            except ValueError:
+                rel = str(entry)
             if entry.is_dir():
                 self.dir_count += 1
                 node = parent_node.add(
                     entry.name,
-                    data={"path": entry, "is_dir": True},
+                    data={"path": entry, "is_dir": True, "rel": rel},
                 )
                 self._build_subtree(node, entry)
             else:
                 self.file_count += 1
                 parent_node.add_leaf(
                     entry.name,
-                    data={"path": entry, "is_dir": False},
+                    data={"path": entry, "is_dir": False, "rel": rel},
                 )
 
         # Add ghost nodes for recently deleted files in this directory
@@ -631,10 +647,7 @@ class ProjectTree(Tree[dict]):
             label.append(icon)
             label.append(str(node.label), style=style)
 
-        try:
-            rel = str(path_obj.relative_to(self.watch_path))
-        except ValueError:
-            rel = str(path_obj)
+        rel = data.get("rel") or str(path_obj)
         git_st = self.git_statuses.get(rel)
         if git_st:
             git_color = GIT_COLORS.get(git_st, "white")
@@ -738,8 +751,6 @@ class ProjectTree(Tree[dict]):
             if node is not None and node.is_expanded:
                 node.collapse()
 
-    def refresh_git(self):
-        self.git_statuses = _get_git_status(self.watch_path)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -767,6 +778,9 @@ class ArgusApp(App):
         self._pending: dict[str, tuple[str, float, bool]] = {}
         self._previewed_path: Optional[Path] = None
         self._tailer: Optional[TranscriptTailer] = None
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self._git_future: Optional[concurrent.futures.Future] = None
+        self._last_session_check = 0.0
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -791,7 +805,7 @@ class ArgusApp(App):
         self.query_one("#activity-feed").border_title = "\U0001f4e1 Activity"
 
         tree = self.query_one("#project-tree", ProjectTree)
-        tree.refresh_git()
+        tree.git_statuses = _get_git_status(self.watch_path)
         self._update_stats()
 
         preview = self.query_one("#file-preview", FilePreview)
@@ -929,22 +943,54 @@ class ArgusApp(App):
             preview = self.query_one("#file-preview", FilePreview)
             preview.show_file(self._previewed_path)
 
-        # ── Step 6-7: Structural change → rebuild; visual change → refresh only ──
+        # ── Step 6: Collect async git results if ready ──
+        if self._git_future and self._git_future.done():
+            try:
+                tree.git_statuses = self._git_future.result()
+            except Exception:
+                pass
+            self._git_future = None
+            needs_refresh = True
+
+        # ── Step 7: Structural change → rebuild; visual change → refresh only ──
         if needs_rebuild:
-            tree.refresh_git()
+            self._request_git_refresh()
             tree.rebuild()
             self._update_stats()
         elif needs_refresh or tree.file_events or tree.claude_active or tree.ghost_files:
             tree._updates += 1
             tree.refresh()
 
+    def _request_git_refresh(self):
+        """Submit git status to background thread (non-blocking)."""
+        if self._git_future is None or self._git_future.done():
+            self._git_future = self._executor.submit(
+                _get_git_status, self.watch_path
+            )
+
     def _maintenance(self):
         """Periodic housekeeping: git, prune old events, prune ghosts, auto-collapse."""
         tree = self.query_one("#project-tree", ProjectTree)
         now = time.time()
 
-        # Refresh git status (catches commits, checkouts, etc.)
-        tree.refresh_git()
+        # Refresh git status in background (non-blocking)
+        self._request_git_refresh()
+
+        # Re-check for Claude session (handles restarts)
+        if now - self._last_session_check > SESSION_RECHECK_INTERVAL:
+            self._last_session_check = now
+            session_dir = _find_session_dir(self.watch_path)
+            if session_dir:
+                if self._tailer is None or self._tailer.session_dir != session_dir:
+                    self._tailer = TranscriptTailer(session_dir)
+                    feed = self.query_one("#activity-feed", ActivityFeed)
+                    msg = Text()
+                    msg.append(
+                        " \U0001f916 Tracking Claude Code session ",
+                        style=Style(bold=True, color="bright_magenta"),
+                    )
+                    msg.append(str(session_dir.name)[:12] + "...", style=Style(color="magenta", dim=True))
+                    feed.write(msg)
 
         # Prune old file events (> 15 min)
         cutoff = now - 900
@@ -952,7 +998,7 @@ class ArgusApp(App):
         for k in stale:
             del tree.file_events[k]
 
-        # Prune expired ghosts → rebuild to remove ghost nodes
+        # Prune expired ghosts — batch into single rebuild
         ghost_cutoff = now - GHOST_DURATION
         stale_ghosts = [k for k, ts in tree.ghost_files.items() if ts < ghost_cutoff]
         for k in stale_ghosts:
@@ -1010,6 +1056,7 @@ class ArgusApp(App):
         if self._observer:
             self._observer.stop()
             self._observer.join(timeout=2)
+        self._executor.shutdown(wait=False)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

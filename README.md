@@ -1,5 +1,7 @@
 # Argus — The All-Seeing Eye
 
+![demo](demo.gif)
+
 **A real-time TUI that watches your project so you don't have to.**
 
 Ever been deep in a Claude Code session, vibing in the CLI, only to resurface and wonder *"wait... how big is this thing now?"* Yeah. Same.
